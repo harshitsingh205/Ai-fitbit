@@ -1,0 +1,1680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NutriFit AI - Body Weight Calorie & Diet Advice</title>
+    
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            50: '#f0fdf4',
+                            100: '#dcfce7',
+                            500: '#22c55e',
+                            600: '#16a34a',
+                            700: '#15803d',
+                            800: '#166534',
+                            900: '#14532d',
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <!-- React and Babel CDN -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8fafc;
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #f1f5f9;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+        @keyframes pulse-subtle {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        .animate-pulse-subtle {
+            animation: pulse-subtle 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased min-h-screen selection:bg-brand-500 selection:text-white">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        // --- GEMINI API UTILITY ---
+        async function fetchGeminiAdvice(prompt, systemInstruction = "", responseSchema = null) {
+            const apiKey = ""; // Canvas runtime automatically supplies API key when empty
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+
+            const payload = {
+                contents: [{ parts: [{ text: prompt }] }],
+            };
+
+            if (systemInstruction) {
+                payload.systemInstruction = {
+                    parts: [{ text: systemInstruction }]
+                };
+            }
+
+            if (responseSchema) {
+                payload.generationConfig = {
+                    responseMimeType: "application/json",
+                    responseSchema: responseSchema
+                };
+            }
+
+            let retries = 3;
+            let delay = 1000;
+
+            while (retries > 0) {
+                try {
+                    const res = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!res.ok) {
+                        throw new Error(`HTTP error ${res.status}`);
+                    }
+
+                    const data = await res.json();
+                    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                    return text;
+                } catch (err) {
+                    retries--;
+                    if (retries === 0) throw err;
+                    await new Promise(r => setTimeout(r, delay));
+                    delay *= 2;
+                }
+            }
+        }
+
+        // --- HELPER CALCULATIONS ---
+        function calculateNutrition(profile) {
+            let { gender, age, heightCm, weightKg, activityLevel, goal, pace, dietType } = profile;
+            
+            // BMR using Mifflin-St Jeor Equation
+            let bmr = 0;
+            if (gender === 'male') {
+                bmr = (10 * weightKg) + (6.25 * heightCm) - (5 * age) + 5;
+            } else {
+                bmr = (10 * weightKg) + (6.25 * heightCm) - (5 * age) - 161;
+            }
+
+            // Activity Multiplier
+            const activityMultipliers = {
+                sedentary: 1.2,      // Little or no exercise
+                light: 1.375,        // Light exercise 1-3 days/week
+                moderate: 1.55,      // Moderate exercise 3-5 days/week
+                active: 1.725,       // Hard exercise 6-7 days/week
+                very_active: 1.9    // Intense physical job or training
+            };
+
+            const tdee = Math.round(bmr * (activityMultipliers[activityLevel] || 1.2));
+
+            // Goal Adjustment
+            let goalAdjustment = 0;
+            if (goal === 'lose') {
+                if (pace === 'mild') goalAdjustment = -250;
+                else if (pace === 'fast') goalAdjustment = -750;
+                else goalAdjustment = -500; // standard 0.5kg/week
+            } else if (goal === 'gain') {
+                if (pace === 'mild') goalAdjustment = +250;
+                else if (pace === 'fast') goalAdjustment = +500;
+                else goalAdjustment = +350;
+            }
+
+            let targetCalories = Math.max(1200, Math.round(tdee + goalAdjustment));
+
+            // Macros calculation according to Diet Preference
+            let proteinPct = 0.30, carbPct = 0.40, fatPct = 0.30;
+            if (dietType === 'high_protein') {
+                proteinPct = 0.40; carbPct = 0.35; fatPct = 0.25;
+            } else if (dietType === 'low_carb') {
+                proteinPct = 0.35; carbPct = 0.20; fatPct = 0.45;
+            } else if (dietType === 'keto') {
+                proteinPct = 0.25; carbPct = 0.05; fatPct = 0.70;
+            } else if (dietType === 'vegan' || dietType === 'vegetarian') {
+                proteinPct = 0.25; carbPct = 0.50; fatPct = 0.25;
+            }
+
+            const proteinGrams = Math.round((targetCalories * proteinPct) / 4);
+            const carbGrams = Math.round((targetCalories * carbPct) / 4);
+            const fatGrams = Math.round((targetCalories * fatPct) / 9);
+
+            // Water intake recommendation (Liters)
+            const waterLiters = ((weightKg * 0.033) + (activityLevel === 'active' || activityLevel === 'very_active' ? 0.6 : 0.3)).toFixed(1);
+
+            // BMI Calculation
+            const heightM = heightCm / 100;
+            const bmi = parseFloat((weightKg / (heightM * heightM)).toFixed(1));
+            
+            let bmiCategory = "Normal weight";
+            let bmiColor = "text-emerald-600 bg-emerald-50 border-emerald-200";
+            if (bmi < 18.5) { bmiCategory = "Underweight"; bmiColor = "text-amber-600 bg-amber-50 border-amber-200"; }
+            else if (bmi >= 25 && bmi < 29.9) { bmiCategory = "Overweight"; bmiColor = "text-orange-600 bg-orange-50 border-orange-200"; }
+            else if (bmi >= 30) { bmiCategory = "Obese"; bmiColor = "text-red-600 bg-red-50 border-red-200"; }
+
+            // Ideal Weight Range (BMI 18.5 - 24.9)
+            const idealWeightMin = Math.round(18.5 * heightM * heightM);
+            const idealWeightMax = Math.round(24.9 * heightM * heightM);
+
+            return {
+                bmr,
+                tdee,
+                targetCalories,
+                macros: { proteinGrams, carbGrams, fatGrams },
+                waterLiters,
+                bmi,
+                bmiCategory,
+                bmiColor,
+                idealWeightMin,
+                idealWeightMax
+            };
+        }
+
+        // Default Initial Profile
+        const DEFAULT_PROFILE = {
+            unit: 'metric', // metric (kg, cm) or imperial (lbs, inches)
+            gender: 'female',
+            age: 28,
+            heightCm: 168,
+            weightKg: 68,
+            targetWeightKg: 62,
+            activityLevel: 'moderate',
+            goal: 'lose', // lose, maintain, gain
+            pace: 'standard', // mild, standard, fast
+            dietType: 'balanced' // balanced, high_protein, low_carb, keto, vegetarian, vegan
+        };
+
+        function App() {
+            // Profile State with LocalStorage
+            const [profile, setProfile] = useState(() => {
+                const saved = localStorage.getItem('nutrifit_profile');
+                return saved ? JSON.parse(saved) : DEFAULT_PROFILE;
+            });
+
+            const [activeTab, setActiveTab] = useState('calculator'); // calculator, ai_advice, tracker, progress
+            const [toastMessage, setToastMessage] = useState(null);
+
+            // Daily Food Log State
+            const [foodLogs, setFoodLogs] = useState(() => {
+                const saved = localStorage.getItem('nutrifit_logs');
+                return saved ? JSON.parse(saved) : [];
+            });
+
+            // Water intake tracker
+            const [waterIntake, setWaterIntake] = useState(() => {
+                const saved = localStorage.getItem('nutrifit_water');
+                return saved ? JSON.parse(saved) : 0;
+            });
+
+            // Weight History Log State
+            const [weightHistory, setWeightHistory] = useState(() => {
+                const saved = localStorage.getItem('nutrifit_weight_history');
+                return saved ? JSON.parse(saved) : [
+                    { date: new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0], weight: profile.weightKg + 3 },
+                    { date: new Date(Date.now() - 15 * 86400000).toISOString().split('T')[0], weight: profile.weightKg + 1.2 },
+                    { date: new Date().toISOString().split('T')[0], weight: profile.weightKg }
+                ];
+            });
+
+            // AI State
+            const [aiAdvice, setAiAdvice] = useState(null);
+            const [isGeneratingAdvice, setIsGeneratingAdvice] = useState(false);
+            const [customMealPlan, setCustomMealPlan] = useState(null);
+            const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
+            const [chatMessages, setChatMessages] = useState([
+                { sender: 'ai', text: "Hello! I'm your AI Dietitian. Based on your body weight and daily goals, feel free to ask me anything about meal planning, healthy swaps, or optimizing your macros!" }
+            ]);
+
+            // Save to LocalStorage
+            useEffect(() => {
+                localStorage.setItem('nutrifit_profile', JSON.stringify(profile));
+            }, [profile]);
+
+            useEffect(() => {
+                localStorage.setItem('nutrifit_logs', JSON.stringify(foodLogs));
+            }, [foodLogs]);
+
+            useEffect(() => {
+                localStorage.setItem('nutrifit_water', JSON.stringify(waterIntake));
+            }, [waterIntake]);
+
+            useEffect(() => {
+                localStorage.setItem('nutrifit_weight_history', JSON.stringify(weightHistory));
+            }, [weightHistory]);
+
+            const showToast = (msg) => {
+                setToastMessage(msg);
+                setTimeout(() => setToastMessage(null), 3000);
+            };
+
+            // Calculated Stats
+            const nutrition = useMemo(() => calculateNutrition(profile), [profile]);
+
+            // Todays Consumed Totals
+            const todayStr = new Date().toISOString().split('T')[0];
+            const todaysLogs = foodLogs.filter(item => item.date === todayStr);
+
+            const consumedTotals = useMemo(() => {
+                return todaysLogs.reduce((acc, curr) => {
+                    acc.calories += Number(curr.calories || 0);
+                    acc.protein += Number(curr.protein || 0);
+                    acc.carbs += Number(curr.carbs || 0);
+                    acc.fat += Number(curr.fat || 0);
+                    return acc;
+                }, { calories: 0, protein: 0, carbs: 0, fat: 0 });
+            }, [todaysLogs]);
+
+            // Generate AI Advice based on Body Metrics
+            const generateAiAdvice = async () => {
+                setIsGeneratingAdvice(true);
+                const prompt = `
+                    Analyze this user profile and calorie/nutrition requirement:
+                    - Gender: ${profile.gender}, Age: ${profile.age}
+                    - Weight: ${profile.weightKg} kg, Target Weight: ${profile.targetWeightKg} kg, Height: ${profile.heightCm} cm
+                    - BMI: ${nutrition.bmi} (${nutrition.bmiCategory})
+                    - Goal: ${profile.goal} weight (Pace: ${profile.pace})
+                    - Activity Level: ${profile.activityLevel}
+                    - Calculated BMR: ${nutrition.bmr} kcal, TDEE: ${nutrition.tdee} kcal
+                    - Daily Target Calories: ${nutrition.targetCalories} kcal
+                    - Target Protein: ${nutrition.macros.proteinGrams}g, Carbs: ${nutrition.macros.carbGrams}g, Fat: ${nutrition.macros.fatGrams}g
+                    - Diet Preference: ${profile.dietType}
+
+                    Provide a comprehensive, empathetic, and actionable diet & nutrition advice report.
+                    Include:
+                    1. Body Requirement Assessment (Explain why these calories and macros fit their goal).
+                    2. 4 Key Dietary & Lifestyle Guidelines for Success.
+                    3. Best Protein & Whole Food Sources for their diet preference (${profile.dietType}).
+                    4. Potential Pitfalls to Avoid for their specific goal.
+                    5. Healthy Hydration & Recovery Tips.
+
+                    Format with clear markdown headings and bullet points. Keep it engaging and motivating!
+                `;
+
+                const sysInst = "You are a top clinical nutritionist and sports dietitian. Provide clear, scientific, practical, and highly personalized advice based on body weight requirements.";
+
+                try {
+                    const text = await fetchGeminiAdvice(prompt, sysInst);
+                    setAiAdvice(text);
+                    showToast("AI Nutrition Advice updated!");
+                } catch (e) {
+                    showToast("Failed to fetch AI advice. Please check connection.");
+                } finally {
+                    setIsGeneratingAdvice(false);
+                }
+            };
+
+            // Generate AI Meal Plan
+            const generateAiMealPlan = async () => {
+                setIsGeneratingPlan(true);
+                const prompt = `
+                    Create a structured 1-Day Sample Meal Plan tailored specifically to these daily targets:
+                    - Daily Target Calories: ${nutrition.targetCalories} kcal
+                    - Target Protein: ${nutrition.macros.proteinGrams}g
+                    - Target Carbs: ${nutrition.macros.carbGrams}g
+                    - Target Fat: ${nutrition.macros.fatGrams}g
+                    - Diet Preference: ${profile.dietType}
+
+                    Break it down into 4 meals:
+                    1. Breakfast
+                    2. Lunch
+                    3. Afternoon Snack
+                    4. Dinner
+
+                    For each meal provide: Meal name, Brief ingredients/recipe note, Estimated Calories, Protein (g), Carbs (g), Fat (g).
+                `;
+
+                const schema = {
+                    type: "OBJECT",
+                    properties: {
+                        meals: {
+                            type: "ARRAY",
+                            items: {
+                                type: "OBJECT",
+                                properties: {
+                                    mealName: { type: "STRING" },
+                                    title: { type: "STRING" },
+                                    ingredients: { type: "STRING" },
+                                    calories: { type: "NUMBER" },
+                                    protein: { type: "NUMBER" },
+                                    carbs: { type: "NUMBER" },
+                                    fat: { type: "NUMBER" }
+                                },
+                                required: ["mealName", "title", "ingredients", "calories", "protein", "carbs", "fat"]
+                            }
+                        },
+                        totalCalories: { type: "NUMBER" },
+                        nutritionTips: { type: "STRING" }
+                    },
+                    required: ["meals", "totalCalories", "nutritionTips"]
+                };
+
+                try {
+                    const resJson = await fetchGeminiAdvice(prompt, "You are a professional chef and sports nutritionist.", schema);
+                    const parsed = JSON.parse(resJson);
+                    setCustomMealPlan(parsed);
+                    showToast("Generated personalized meal plan!");
+                } catch (e) {
+                    showToast("Failed to generate meal plan.");
+                } finally {
+                    setIsGeneratingPlan(false);
+                }
+            };
+
+            return (
+                <div className="min-h-screen flex flex-col">
+                    {/* Top Header */}
+                    <header className="bg-white border-b border-slate-200 sticky top-0 z-30">
+                        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div className="flex justify-between items-center h-16">
+                                {/* Logo & Title */}
+                                <div className="flex items-center space-x-3">
+                                    <div className="relative group cursor-pointer">
+                                        <div className="absolute -inset-1 bg-gradient-to-r from-brand-500 via-emerald-400 to-teal-400 rounded-2xl blur-sm opacity-70 group-hover:opacity-100 transition duration-300"></div>
+                                        <div className="relative w-11 h-11 rounded-xl bg-slate-900 flex items-center justify-center text-white shadow-md border border-brand-500/30">
+                                            <svg className="w-6 h-6 text-brand-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                                <path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"/>
+                                                <path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12"/>
+                                            </svg>
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <h1 className="text-xl font-extrabold text-slate-900 tracking-tight flex items-center gap-1.5">
+                                            NutriFit 
+                                            <span className="bg-gradient-to-r from-brand-600 to-emerald-500 text-white text-[11px] font-black px-2 py-0.5 rounded-md shadow-sm uppercase tracking-wider">AI</span>
+                                        </h1>
+                                        <p className="text-xs text-slate-500 hidden sm:block font-medium">Calorie & Diet Advisor based on Body Weight</p>
+                                    </div>
+                                </div>
+
+                                {/* Quick Summary Badge */}
+                                <div className="hidden md:flex items-center space-x-6 bg-slate-50 px-4 py-2 rounded-xl border border-slate-200 text-sm">
+                                    <div>
+                                        <span className="text-xs text-slate-400 block font-medium">Daily Target</span>
+                                        <span className="font-bold text-slate-800">{nutrition.targetCalories} <span className="text-xs font-normal text-slate-500">kcal</span></span>
+                                    </div>
+                                    <div className="h-7 w-[1px] bg-slate-200"></div>
+                                    <div>
+                                        <span className="text-xs text-slate-400 block font-medium">Today Consumed</span>
+                                        <span className={`font-bold ${consumedTotals.calories > nutrition.targetCalories ? 'text-red-600' : 'text-brand-600'}`}>
+                                            {consumedTotals.calories} <span className="text-xs font-normal text-slate-500">kcal</span>
+                                        </span>
+                                    </div>
+                                    <div className="h-7 w-[1px] bg-slate-200"></div>
+                                    <div>
+                                        <span className="text-xs text-slate-400 block font-medium">BMI</span>
+                                        <span className="font-bold text-slate-800">{nutrition.bmi} <span className="text-xs font-normal text-slate-500">({nutrition.bmiCategory})</span></span>
+                                    </div>
+                                </div>
+
+                                {/* Goal Badge */}
+                                <div className="flex items-center space-x-2">
+                                    <span className="px-3 py-1 rounded-full text-xs font-semibold bg-brand-50 text-brand-700 border border-brand-200 capitalize flex items-center gap-1.5">
+                                        <i className="fa-solid fa-bullseye text-brand-600"></i>
+                                        {profile.goal} Weight ({profile.weightKg} → {profile.targetWeightKg} kg)
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Navigation Tabs */}
+                        <div className="bg-slate-50/80 backdrop-blur border-t border-slate-200">
+                            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                                <nav className="flex space-x-2 sm:space-x-8 overflow-x-auto no-scrollbar py-2">
+                                    <button
+                                        onClick={() => setActiveTab('calculator')}
+                                        className={`flex items-center gap-2 py-2 px-3 sm:px-4 rounded-lg text-sm font-medium transition-all whitespace-nowrap ${
+                                            activeTab === 'calculator'
+                                                ? 'bg-white text-brand-700 shadow-sm border border-slate-200'
+                                                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                                        }`}
+                                    >
+                                        <i className="fa-solid fa-calculator text-brand-600"></i>
+                                        <span>Weight & Calorie Requirements</span>
+                                    </button>
+
+                                    <button
+                                        onClick={() => setActiveTab('ai_advice')}
+                                        className={`flex items-center gap-2 py-2 px-3 sm:px-4 rounded-lg text-sm font-medium transition-all whitespace-nowrap ${
+                                            activeTab === 'ai_advice'
+                                                ? 'bg-white text-brand-700 shadow-sm border border-slate-200'
+                                                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                                        }`}
+                                    >
+                                        <i className="fa-solid fa-wand-magic-sparkles text-brand-600"></i>
+                                        <span>AI Diet Advice & Meal Plan</span>
+                                    </button>
+
+                                    <button
+                                        onClick={() => setActiveTab('tracker')}
+                                        className={`flex items-center gap-2 py-2 px-3 sm:px-4 rounded-lg text-sm font-medium transition-all whitespace-nowrap ${
+                                            activeTab === 'tracker'
+                                                ? 'bg-white text-brand-700 shadow-sm border border-slate-200'
+                                                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                                        }`}
+                                    >
+                                        <i className="fa-solid fa-utensils text-brand-600"></i>
+                                        <span>Daily Food & Macro Log</span>
+                                    </button>
+
+                                    <button
+                                        onClick={() => setActiveTab('progress')}
+                                        className={`flex items-center gap-2 py-2 px-3 sm:px-4 rounded-lg text-sm font-medium transition-all whitespace-nowrap ${
+                                            activeTab === 'progress'
+                                                ? 'bg-white text-brand-700 shadow-sm border border-slate-200'
+                                                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                                        }`}
+                                    >
+                                        <i className="fa-solid fa-chart-line text-brand-600"></i>
+                                        <span>Progress & Analytics</span>
+                                    </button>
+                                </nav>
+                            </div>
+                        </div>
+                    </header>
+
+                    {/* Toast Notification */}
+                    {toastMessage && (
+                        <div className="fixed bottom-5 right-5 z-50 bg-slate-900 text-white px-4 py-3 rounded-xl shadow-xl flex items-center space-x-3 text-sm animate-bounce">
+                            <i className="fa-solid fa-circle-check text-emerald-400 text-lg"></i>
+                            <span>{toastMessage}</span>
+                        </div>
+                    )}
+
+                    {/* Main Content Area */}
+                    <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8">
+                        {activeTab === 'calculator' && (
+                            <CalculatorTab
+                                profile={profile}
+                                setProfile={setProfile}
+                                nutrition={nutrition}
+                                showToast={showToast}
+                                onGoToAdvice={() => setActiveTab('ai_advice')}
+                            />
+                        )}
+
+                        {activeTab === 'ai_advice' && (
+                            <AiAdviceTab
+                                profile={profile}
+                                nutrition={nutrition}
+                                aiAdvice={aiAdvice}
+                                isGeneratingAdvice={isGeneratingAdvice}
+                                generateAiAdvice={generateAiAdvice}
+                                customMealPlan={customMealPlan}
+                                isGeneratingPlan={isGeneratingPlan}
+                                generateAiMealPlan={generateAiMealPlan}
+                                chatMessages={chatMessages}
+                                setChatMessages={setChatMessages}
+                                showToast={showToast}
+                            />
+                        )}
+
+                        {activeTab === 'tracker' && (
+                            <FoodTrackerTab
+                                nutrition={nutrition}
+                                foodLogs={foodLogs}
+                                setFoodLogs={setFoodLogs}
+                                todaysLogs={todaysLogs}
+                                consumedTotals={consumedTotals}
+                                waterIntake={waterIntake}
+                                setWaterIntake={setWaterIntake}
+                                showToast={showToast}
+                            />
+                        )}
+
+                        {activeTab === 'progress' && (
+                            <ProgressTab
+                                profile={profile}
+                                setProfile={setProfile}
+                                nutrition={nutrition}
+                                weightHistory={weightHistory}
+                                setWeightHistory={setWeightHistory}
+                                showToast={showToast}
+                            />
+                        )}
+                    </main>
+
+                    {/* Footer */}
+                    <footer className="bg-white border-t border-slate-200 mt-auto py-6 text-center text-xs text-slate-500">
+                        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row justify-between items-center gap-3">
+                            <p>© 2026 NutriFit AI. Personalized body-weight science & AI diet coaching.</p>
+                            <p className="text-slate-400">Disclaimer: Consult a medical professional for clinical health conditions.</p>
+                        </div>
+                    </footer>
+                </div>
+            );
+        }
+
+        function CalculatorTab({ profile, setProfile, nutrition, showToast, onGoToAdvice }) {
+            const handleChange = (e) => {
+                const { name, value } = e.target;
+                setProfile(prev => ({
+                    ...prev,
+                    [name]: ['age', 'heightCm', 'weightKg', 'targetWeightKg'].includes(name) ? Number(value) : value
+                }));
+            };
+
+            return (
+                <div className="space-y-8">
+                    {/* Header Banner */}
+                    <div className="bg-gradient-to-r from-slate-900 via-slate-800 to-brand-950 text-white rounded-3xl p-6 sm:p-8 shadow-xl relative overflow-hidden">
+                        <div className="absolute right-0 top-0 bottom-0 opacity-10 flex items-center pr-10 pointer-events-none">
+                            <i className="fa-solid fa-weight-scale text-[180px] text-white"></i>
+                        </div>
+                        <div className="relative z-10 max-w-2xl">
+                            <span className="bg-brand-500/20 text-brand-300 text-xs font-semibold px-3 py-1 rounded-full uppercase tracking-wider border border-brand-500/30">
+                                Scientifically Grounded
+                            </span>
+                            <h2 className="text-2xl sm:text-3xl font-bold mt-3 mb-2">Body Weight & Energy Calculator</h2>
+                            <p className="text-slate-300 text-sm leading-relaxed">
+                                Enter your exact height, body weight, activity level, and weight goal. Our engine uses the Mifflin-St Jeor formula to calculate your exact Basal Metabolic Rate (BMR), TDEE, and ideal calorie & macronutrient intake.
+                            </p>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                        {/* Input Form Column */}
+                        <div className="lg:col-span-7 bg-white rounded-2xl p-6 sm:p-8 border border-slate-200 shadow-sm space-y-6">
+                            <div className="flex items-center justify-between border-b border-slate-100 pb-4">
+                                <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+                                    <i className="fa-solid fa-sliders text-brand-600"></i>
+                                    Your Body Profile Inputs
+                                </h3>
+                                <span className="text-xs text-slate-400">Step 1 of 2</span>
+                            </div>
+
+                            {/* Gender & Age */}
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs font-semibold text-slate-700 mb-2 uppercase tracking-wider">Biological Sex</label>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <button
+                                            type="button"
+                                            onClick={() => setProfile(p => ({ ...p, gender: 'female' }))}
+                                            className={`py-2.5 px-4 rounded-xl text-sm font-semibold border flex items-center justify-center gap-2 transition-all ${
+                                                profile.gender === 'female'
+                                                    ? 'bg-brand-50 border-brand-500 text-brand-700 ring-2 ring-brand-500/20'
+                                                    : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                                            }`}
+                                        >
+                                            <i className="fa-solid fa-venus"></i> Female
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setProfile(p => ({ ...p, gender: 'male' }))}
+                                            className={`py-2.5 px-4 rounded-xl text-sm font-semibold border flex items-center justify-center gap-2 transition-all ${
+                                                profile.gender === 'male'
+                                                    ? 'bg-brand-50 border-brand-500 text-brand-700 ring-2 ring-brand-500/20'
+                                                    : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                                            }`}
+                                        >
+                                            <i className="fa-solid fa-mars"></i> Male
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className="block text-xs font-semibold text-slate-700 mb-2 uppercase tracking-wider">Age (Years)</label>
+                                    <input
+                                        type="number"
+                                        name="age"
+                                        min="12"
+                                        max="100"
+                                        value={profile.age}
+                                        onChange={handleChange}
+                                        className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-brand-500 focus:border-brand-500 text-slate-800 font-medium"
+                                    />
+                                </div>
+                            </div>
+
+                            {/* Height & Weights */}
+                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                <div>
+                                    <label className="block text-xs font-semibold text-slate-700 mb-2 uppercase tracking-wider">Height (cm)</label>
+                                    <input
+                                        type="number"
+                                        name="heightCm"
+                                        min="100"
+                                        max="250"
+                                        value={profile.heightCm}
+                                        onChange={handleChange}
+                                        className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-brand-500 focus:border-brand-500 text-slate-800 font-medium"
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className="block text-xs font-semibold text-slate-700 mb-2 uppercase tracking-wider">Current Weight (kg)</label>
+                                    <input
+                                        type="number"
+                                        name="weightKg"
+                                        step="0.5"
+                                        min="30"
+                                        max="250"
+                                        value={profile.weightKg}
+                                        onChange={handleChange}
+                                        className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-brand-500 focus:border-brand-500 text-slate-800 font-medium"
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className="block text-xs font-semibold text-slate-700 mb-2 uppercase tracking-wider">Target Weight (kg)</label>
+                                    <input
+                                        type="number"
+                                        name="targetWeightKg"
+                                        step="0.5"
+                                        min="30"
+                                        max="250"
+                                        value={profile.targetWeightKg}
+                                        onChange={handleChange}
+                                        className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-brand-500 focus:border-brand-500 text-slate-800 font-medium"
+                                    />
+                                </div>
+                            </div>
+
+                            {/* Activity Level */}
+                            <div>
+                                <label className="block text-xs font-semibold text-slate-700 mb-2 uppercase tracking-wider">Daily Activity Level</label>
+                                <select
+                                    name="activityLevel"
+                                    value={profile.activityLevel}
+                                    onChange={handleChange}
+                                    className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-brand-500 focus:border-brand-500 text-slate-800 font-medium bg-white"
+                                >
+                                    <option value="sedentary">Sedentary (Desk job, minimal exercise)</option>
+                                    <option value="light">Lightly Active (Light exercise 1-3 days/week)</option>
+                                    <option value="moderate">Moderately Active (Moderate exercise 3-5 days/week)</option>
+                                    <option value="active">Very Active (Hard exercise 6-7 days/week)</option>
+                                    <option value="very_active">Extra Active (Physical job or intense training)</option>
+                                </select>
+                            </div>
+
+                            {/* Goal & Pace */}
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs font-semibold text-slate-700 mb-2 uppercase tracking-wider">Primary Goal</label>
+                                    <select
+                                        name="goal"
+                                        value={profile.goal}
+                                        onChange={handleChange}
+                                        className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-brand-500 focus:border-brand-500 text-slate-800 font-medium bg-white"
+                                    >
+                                        <option value="lose">Lose Weight / Fat Loss</option>
+                                        <option value="maintain">Maintain Current Weight</option>
+                                        <option value="gain">Gain Muscle / Weight Gain</option>
+                                    </select>
+                                </div>
+
+                                {profile.goal !== 'maintain' && (
+                                    <div>
+                                        <label className="block text-xs font-semibold text-slate-700 mb-2 uppercase tracking-wider">Pace / Intensity</label>
+                                        <select
+                                            name="pace"
+                                            value={profile.pace}
+                                            onChange={handleChange}
+                                            className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-brand-500 focus:border-brand-500 text-slate-800 font-medium bg-white"
+                                        >
+                                            <option value="mild">Mild (Slow & Steady ~0.25 kg/week)</option>
+                                            <option value="standard">Standard Recommended (~0.5 kg/week)</option>
+                                            <option value="fast">Aggressive (~0.75 kg/week)</option>
+                                        </select>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Diet Preference */}
+                            <div>
+                                <label className="block text-xs font-semibold text-slate-700 mb-2 uppercase tracking-wider">Diet Style / Preference</label>
+                                <select
+                                    name="dietType"
+                                    value={profile.dietType}
+                                    onChange={handleChange}
+                                    className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-brand-500 focus:border-brand-500 text-slate-800 font-medium bg-white"
+                                >
+                                    <option value="balanced">Balanced Diet (30% Protein, 40% Carbs, 30% Fat)</option>
+                                    <option value="high_protein">High Protein / Athletic (40% Protein, 35% Carbs, 25% Fat)</option>
+                                    <option value="low_carb">Low Carb (35% Protein, 20% Carbs, 45% Fat)</option>
+                                    <option value="keto">Ketogenic (25% Protein, 5% Carbs, 70% Fat)</option>
+                                    <option value="vegetarian">Vegetarian (Balanced Plant/Dairy)</option>
+                                    <option value="vegan">Vegan / Strict Plant-Based</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        {/* Calculated Results Column */}
+                        <div className="lg:col-span-5 space-y-6">
+                            {/* Primary Result Box */}
+                            <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-6">
+                                <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                                    <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                                        <i className="fa-solid fa-fire text-amber-500"></i>
+                                        Calculated Calorie Target
+                                    </h3>
+                                    <span className="text-xs bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full font-medium">Daily Target</span>
+                                </div>
+
+                                <div className="text-center py-3 bg-gradient-to-b from-brand-50/50 to-emerald-50/20 rounded-2xl border border-brand-100">
+                                    <span className="text-4xl sm:text-5xl font-black text-brand-700 tracking-tight">
+                                        {nutrition.targetCalories}
+                                    </span>
+                                    <span className="text-sm font-semibold text-brand-600 block mt-1">Calories / day</span>
+                                    <p className="text-xs text-slate-500 mt-2 px-4">
+                                        Designed to help you reach <strong className="text-slate-800">{profile.targetWeightKg} kg</strong> safely based on your metabolic output.
+                                    </p>
+                                </div>
+
+                                {/* BMR & TDEE breakdown */}
+                                <div className="grid grid-cols-2 gap-3 text-center">
+                                    <div className="bg-slate-50 p-3 rounded-xl border border-slate-100">
+                                        <span className="text-xs text-slate-400 block font-medium">Basal Metabolic Rate (BMR)</span>
+                                        <span className="text-lg font-bold text-slate-800">{nutrition.bmr} <span className="text-xs text-slate-500">kcal</span></span>
+                                        <span className="text-[10px] text-slate-400 block mt-0.5">Calories burned at rest</span>
+                                    </div>
+                                    <div className="bg-slate-50 p-3 rounded-xl border border-slate-100">
+                                        <span className="text-xs text-slate-400 block font-medium">Daily Output (TDEE)</span>
+                                        <span className="text-lg font-bold text-slate-800">{nutrition.tdee} <span className="text-xs text-slate-500">kcal</span></span>
+                                        <span className="text-[10px] text-slate-400 block mt-0.5">Total burn with activity</span>
+                                    </div>
+                                </div>
+
+                                {/* Macros Breakdown */}
+                                <div className="space-y-3 pt-2">
+                                    <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500">Target Macronutrient Split</h4>
+                                    
+                                    {/* Protein */}
+                                    <div>
+                                        <div className="flex justify-between text-xs font-semibold mb-1">
+                                            <span className="text-slate-700 flex items-center gap-1.5">
+                                                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
+                                                Protein
+                                            </span>
+                                            <span className="text-slate-900">{nutrition.macros.proteinGrams}g ({nutrition.macros.proteinGrams * 4} kcal)</span>
+                                        </div>
+                                        <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden">
+                                            <div className="bg-emerald-500 h-full rounded-full" style={{ width: `${(nutrition.macros.proteinGrams * 4 / nutrition.targetCalories) * 100}%` }}></div>
+                                        </div>
+                                    </div>
+
+                                    {/* Carbs */}
+                                    <div>
+                                        <div className="flex justify-between text-xs font-semibold mb-1">
+                                            <span className="text-slate-700 flex items-center gap-1.5">
+                                                <span className="w-2.5 h-2.5 rounded-full bg-amber-500"></span>
+                                                Carbohydrates
+                                            </span>
+                                            <span className="text-slate-900">{nutrition.macros.carbGrams}g ({nutrition.macros.carbGrams * 4} kcal)</span>
+                                        </div>
+                                        <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden">
+                                            <div className="bg-amber-500 h-full rounded-full" style={{ width: `${(nutrition.macros.carbGrams * 4 / nutrition.targetCalories) * 100}%` }}></div>
+                                        </div>
+                                    </div>
+
+                                    {/* Fat */}
+                                    <div>
+                                        <div className="flex justify-between text-xs font-semibold mb-1">
+                                            <span className="text-slate-700 flex items-center gap-1.5">
+                                                <span className="w-2.5 h-2.5 rounded-full bg-rose-500"></span>
+                                                Healthy Fats
+                                            </span>
+                                            <span className="text-slate-900">{nutrition.macros.fatGrams}g ({nutrition.macros.fatGrams * 9} kcal)</span>
+                                        </div>
+                                        <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden">
+                                            <div className="bg-rose-500 h-full rounded-full" style={{ width: `${(nutrition.macros.fatGrams * 9 / nutrition.targetCalories) * 100}%` }}></div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Body Metrics & Water */}
+                                <div className="grid grid-cols-2 gap-3 pt-2">
+                                    <div className={`p-3 rounded-xl border text-center ${nutrition.bmiColor}`}>
+                                        <span className="text-[11px] block font-medium opacity-80">Body Mass Index (BMI)</span>
+                                        <span className="text-xl font-bold">{nutrition.bmi}</span>
+                                        <span className="text-[11px] block font-semibold">{nutrition.bmiCategory}</span>
+                                    </div>
+
+                                    <div className="p-3 rounded-xl border border-sky-200 bg-sky-50 text-sky-800 text-center">
+                                        <span className="text-[11px] block font-medium opacity-80">Daily Water Target</span>
+                                        <span className="text-xl font-bold">{nutrition.waterLiters} L</span>
+                                        <span className="text-[11px] block font-semibold">~{Math.round(nutrition.waterLiters * 4)} Glasses</span>
+                                    </div>
+                                </div>
+
+                                {/* CTA Button to AI advice */}
+                                <button
+                                    onClick={onGoToAdvice}
+                                    className="w-full py-3 px-4 bg-gradient-to-r from-brand-600 to-emerald-600 hover:from-brand-700 hover:to-emerald-700 text-white rounded-xl font-semibold shadow-lg shadow-brand-600/25 transition-all flex items-center justify-center gap-2 group"
+                                >
+                                    <span>Get Personalized AI Diet Advice</span>
+                                    <i className="fa-solid fa-arrow-right text-xs group-hover:translate-x-1 transition-transform"></i>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function AiAdviceTab({
+            profile,
+            nutrition,
+            aiAdvice,
+            isGeneratingAdvice,
+            generateAiAdvice,
+            customMealPlan,
+            isGeneratingPlan,
+            generateAiMealPlan,
+            chatMessages,
+            setChatMessages,
+            showToast
+        }) {
+            const [chatInput, setChatInput] = useState("");
+            const [isSendingMessage, setIsSendingMessage] = useState(false);
+            const chatEndRef = useRef(null);
+
+            useEffect(() => {
+                chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+            }, [chatMessages]);
+
+            const handleSendChat = async (e) => {
+                e?.preventDefault();
+                if (!chatInput.trim() || isSendingMessage) return;
+
+                const userText = chatInput;
+                setChatInput("");
+
+                const newHistory = [...chatMessages, { sender: 'user', text: userText }];
+                setChatMessages(newHistory);
+                setIsSendingMessage(true);
+
+                const prompt = `
+                    The user has a current profile:
+                    - Weight: ${profile.weightKg} kg, Goal: ${profile.goal} weight (${profile.targetWeightKg} kg)
+                    - Target Calories: ${nutrition.targetCalories} kcal/day
+                    - Protein: ${nutrition.macros.proteinGrams}g, Carbs: ${nutrition.macros.carbGrams}g, Fats: ${nutrition.macros.fatGrams}g
+                    - Diet Preference: ${profile.dietType}
+
+                    User question: "${userText}"
+
+                    Provide a concise, highly practical, and helpful dietitian answer.
+                `;
+
+                try {
+                    const reply = await fetchGeminiAdvice(prompt, "You are an expert sports nutritionist and friendly health coach.");
+                    setChatMessages([...newHistory, { sender: 'ai', text: reply }]);
+                } catch (e) {
+                    setChatMessages([...newHistory, { sender: 'ai', text: "Sorry, I had trouble answering that right now. Please try asking again!" }]);
+                } finally {
+                    setIsSendingMessage(false);
+                }
+            };
+
+            return (
+                <div className="space-y-8">
+                    {/* Top Control Bar */}
+                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col md:flex-row items-center justify-between gap-4">
+                        <div>
+                            <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
+                                <i className="fa-solid fa-sparkles text-brand-600"></i>
+                                AI Nutritionist & Diet Advisor
+                            </h2>
+                            <p className="text-xs text-slate-500">
+                                Tailored precisely to your body weight ({profile.weightKg} kg) and goal of {nutrition.targetCalories} kcal.
+                            </p>
+                        </div>
+
+                        <div className="flex flex-wrap gap-3">
+                            <button
+                                onClick={generateAiAdvice}
+                                disabled={isGeneratingAdvice}
+                                className="px-4 py-2.5 bg-brand-600 hover:bg-brand-700 text-white font-medium rounded-xl text-sm transition-all shadow-md shadow-brand-600/20 flex items-center gap-2 disabled:opacity-50"
+                            >
+                                {isGeneratingAdvice ? (
+                                    <>
+                                        <i className="fa-solid fa-spinner fa-spin"></i>
+                                        <span>Analyzing Body Metrics...</span>
+                                    </>
+                                ) : (
+                                    <>
+                                        <i className="fa-solid fa-brain"></i>
+                                        <span>Generate Diet Strategy</span>
+                                    </>
+                                )}
+                            </button>
+
+                            <button
+                                onClick={generateAiMealPlan}
+                                disabled={isGeneratingPlan}
+                                className="px-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-medium rounded-xl text-sm transition-all shadow-md flex items-center gap-2 disabled:opacity-50"
+                            >
+                                {isGeneratingPlan ? (
+                                    <>
+                                        <i className="fa-solid fa-spinner fa-spin"></i>
+                                        <span>Crafting Meal Plan...</span>
+                                    </>
+                                ) : (
+                                    <>
+                                        <i className="fa-solid fa-utensils"></i>
+                                        <span>Generate 1-Day Sample Meal Plan</span>
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                        {/* Left Column: AI Strategy Advice & Meal Plan */}
+                        <div className="lg:col-span-7 space-y-6">
+                            {/* Generated Diet Strategy Card */}
+                            <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
+                                <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                                    <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                                        <i className="fa-solid fa-file-contract text-brand-600"></i>
+                                        Personalized Nutrition Strategy
+                                    </h3>
+                                    {aiAdvice && <span className="text-[11px] bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded font-semibold">Gemini AI Grounded</span>}
+                                </div>
+
+                                {isGeneratingAdvice ? (
+                                    <div className="py-12 text-center space-y-3">
+                                        <i className="fa-solid fa-circle-notch fa-spin text-3xl text-brand-600"></i>
+                                        <p className="text-sm font-medium text-slate-600">Calculating metabolic requirements & compiling dietary advice...</p>
+                                    </div>
+                                ) : aiAdvice ? (
+                                    <div className="prose prose-slate max-w-none text-sm text-slate-700 leading-relaxed space-y-3 custom-scrollbar max-h-[500px] overflow-y-auto pr-2">
+                                        {aiAdvice.split('\n').map((line, idx) => {
+                                            if (line.startsWith('###') || line.startsWith('##')) {
+                                                return <h4 key={idx} className="font-bold text-slate-900 text-base mt-4 mb-2">{line.replace(/#/g, '')}</h4>;
+                                            } else if (line.startsWith('*') || line.startsWith('-')) {
+                                                return <li key={idx} className="ml-4 list-disc">{line.replace(/^[*|-]\s*/, '')}</li>;
+                                            } else if (line.trim()) {
+                                                return <p key={idx}>{line}</p>;
+                                            }
+                                            return null;
+                                        })}
+                                    </div>
+                                ) : (
+                                    <div className="py-10 text-center bg-slate-50 rounded-xl border border-dashed border-slate-200 p-6">
+                                        <i className="fa-solid fa-robot text-3xl text-slate-300 mb-3 block"></i>
+                                        <h4 className="font-bold text-slate-700 text-sm mb-1">No Advice Generated Yet</h4>
+                                        <p className="text-xs text-slate-500 max-w-md mx-auto mb-4">
+                                            Click "Generate Diet Strategy" to get a comprehensive report on calorie target, protein sources, and weight loss/gain principles tailored to your body weight.
+                                        </p>
+                                        <button
+                                            onClick={generateAiAdvice}
+                                            className="px-4 py-2 bg-brand-600 text-white rounded-lg text-xs font-semibold shadow"
+                                        >
+                                            Generate Strategy Now
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Generated Meal Plan Display */}
+                            {customMealPlan && (
+                                <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
+                                    <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                                        <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                                            <i className="fa-solid fa-plate-wheat text-amber-500"></i>
+                                            Tailored 1-Day Meal Breakdown ({customMealPlan.totalCalories} kcal)
+                                        </h3>
+                                        <span className="text-xs text-slate-400 capitalize">{profile.dietType} style</span>
+                                    </div>
+
+                                    <div className="grid grid-cols-1 gap-3">
+                                        {customMealPlan.meals?.map((meal, idx) => (
+                                            <div key={idx} className="bg-slate-50 p-4 rounded-xl border border-slate-200 flex flex-col sm:flex-row justify-between sm:items-center gap-3">
+                                                <div>
+                                                    <span className="text-xs font-bold text-brand-600 uppercase tracking-wider block">{meal.mealName}</span>
+                                                    <h4 className="font-bold text-slate-900 text-sm">{meal.title}</h4>
+                                                    <p className="text-xs text-slate-500 mt-1">{meal.ingredients}</p>
+                                                </div>
+
+                                                <div className="flex sm:flex-col items-center sm:items-end justify-between border-t sm:border-t-0 pt-2 sm:pt-0 border-slate-200">
+                                                    <span className="text-sm font-extrabold text-slate-800">{meal.calories} kcal</span>
+                                                    <div className="text-[11px] text-slate-500 space-x-2">
+                                                        <span>P: <strong className="text-emerald-700">{meal.protein}g</strong></span>
+                                                        <span>C: <strong className="text-amber-700">{meal.carbs}g</strong></span>
+                                                        <span>F: <strong className="text-rose-700">{meal.fat}g</strong></span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+
+                                    {customMealPlan.nutritionTips && (
+                                        <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-xs text-amber-900 flex items-start gap-2">
+                                            <i className="fa-solid fa-lightbulb text-amber-600 mt-0.5"></i>
+                                            <div>
+                                                <strong>Dietitian Note:</strong> {customMealPlan.nutritionTips}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Right Column: AI Nutrition Chatbot */}
+                        <div className="lg:col-span-5">
+                            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm flex flex-col h-[620px]">
+                                {/* Chat Header */}
+                                <div className="p-4 border-b border-slate-100 flex items-center space-x-3 bg-slate-50/50 rounded-t-2xl">
+                                    <div className="w-9 h-9 rounded-full bg-brand-600 text-white flex items-center justify-center font-bold text-sm">
+                                        <i className="fa-solid fa-robot"></i>
+                                    </div>
+                                    <div>
+                                        <h3 className="font-bold text-slate-900 text-sm">Ask AI Diet Coach</h3>
+                                        <p className="text-[11px] text-slate-500">Live Q&A about meals, protein, & calories</p>
+                                    </div>
+                                </div>
+
+                                {/* Chat Messages Area */}
+                                <div className="flex-1 p-4 overflow-y-auto custom-scrollbar space-y-4">
+                                    {chatMessages.map((msg, index) => (
+                                        <div
+                                            key={index}
+                                            className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}
+                                        >
+                                            <div
+                                                className={`max-w-[85%] rounded-2xl px-4 py-3 text-xs sm:text-sm leading-relaxed ${
+                                                    msg.sender === 'user'
+                                                        ? 'bg-brand-600 text-white rounded-br-none shadow-sm'
+                                                        : 'bg-slate-100 text-slate-800 rounded-bl-none border border-slate-200/60'
+                                                }`}
+                                            >
+                                                {msg.text}
+                                            </div>
+                                        </div>
+                                    ))}
+
+                                    {isSendingMessage && (
+                                        <div className="flex justify-start">
+                                            <div className="bg-slate-100 text-slate-500 rounded-2xl px-4 py-2.5 text-xs flex items-center gap-2">
+                                                <i className="fa-solid fa-circle-notch fa-spin text-brand-600"></i>
+                                                <span>Thinking...</span>
+                                            </div>
+                                        </div>
+                                    )}
+                                    <div ref={chatEndRef} />
+                                </div>
+
+                                {/* Sample Chips */}
+                                <div className="p-2 border-t border-slate-100 bg-slate-50/50 flex gap-1.5 overflow-x-auto no-scrollbar">
+                                    {[
+                                        "How to hit my protein target?",
+                                        "Healthy snacks under 150 kcal",
+                                        "What to eat before a workout?"
+                                    ].map((chip, idx) => (
+                                        <button
+                                            key={idx}
+                                            onClick={() => {
+                                                setChatInput(chip);
+                                            }}
+                                            className="text-[11px] bg-white border border-slate-200 text-slate-600 hover:border-brand-500 hover:text-brand-700 px-2.5 py-1 rounded-full whitespace-nowrap transition-colors"
+                                        >
+                                            {chip}
+                                        </button>
+                                    ))}
+                                </div>
+
+                                {/* Chat Input Form */}
+                                <form onSubmit={handleSendChat} className="p-3 border-t border-slate-100 flex items-center gap-2">
+                                    <input
+                                        type="text"
+                                        placeholder="Ask a diet question..."
+                                        value={chatInput}
+                                        onChange={(e) => setChatInput(e.target.value)}
+                                        className="flex-1 px-4 py-2.5 border border-slate-200 rounded-xl text-xs sm:text-sm focus:ring-2 focus:ring-brand-500 focus:border-brand-500"
+                                    />
+                                    <button
+                                        type="submit"
+                                        disabled={!chatInput.trim() || isSendingMessage}
+                                        className="w-10 h-10 bg-brand-600 hover:bg-brand-700 text-white rounded-xl flex items-center justify-center transition-colors disabled:opacity-50"
+                                    >
+                                        <i className="fa-solid fa-paper-plane text-sm"></i>
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function FoodTrackerTab({
+            nutrition,
+            foodLogs,
+            setFoodLogs,
+            todaysLogs,
+            consumedTotals,
+            waterIntake,
+            setWaterIntake,
+            showToast
+        }) {
+            const [activeMealCategory, setActiveMealCategory] = useState("Breakfast");
+            const [foodName, setFoodName] = useState("");
+            const [calories, setCalories] = useState("");
+            const [protein, setProtein] = useState("");
+            const [carbs, setCarbs] = useState("");
+            const [fat, setFat] = useState("");
+
+            // AI Meal Parser Input
+            const [aiMealText, setAiMealText] = useState("");
+            const [isParsingMeal, setIsParsingMeal] = useState(false);
+
+            const handleAddFood = (e) => {
+                e?.preventDefault();
+                if (!foodName || !calories) {
+                    showToast("Please enter food name and calories.");
+                    return;
+                }
+
+                const todayStr = new Date().toISOString().split('T')[0];
+                const newItem = {
+                    id: Date.now(),
+                    date: todayStr,
+                    category: activeMealCategory,
+                    name: foodName,
+                    calories: Number(calories),
+                    protein: Number(protein || 0),
+                    carbs: Number(carbs || 0),
+                    fat: Number(fat || 0)
+                };
+
+                setFoodLogs(prev => [newItem, ...prev]);
+                setFoodName("");
+                setCalories("");
+                setProtein("");
+                setCarbs("");
+                setFat("");
+                showToast(`Added ${newItem.name} to ${activeMealCategory}`);
+            };
+
+            const handleDeleteFood = (id) => {
+                setFoodLogs(prev => prev.filter(item => item.id !== id));
+                showToast("Item removed.");
+            };
+
+            // AI Natural Language Meal Parser
+            const handleParseMealWithAi = async () => {
+                if (!aiMealText.trim()) return;
+                setIsParsingMeal(true);
+
+                const prompt = `
+                    Parse this food description and estimate the total calories, protein (g), carbs (g), and fat (g):
+                    Food description: "${aiMealText}"
+                `;
+
+                const schema = {
+                    type: "OBJECT",
+                    properties: {
+                        foodName: { type: "STRING" },
+                        calories: { type: "NUMBER" },
+                        protein: { type: "NUMBER" },
+                        carbs: { type: "NUMBER" },
+                        fat: { type: "NUMBER" }
+                    },
+                    required: ["foodName", "calories", "protein", "carbs", "fat"]
+                };
+
+                try {
+                    const jsonRes = await fetchGeminiAdvice(prompt, "You are a food database calorie estimation tool.", schema);
+                    const parsed = JSON.parse(jsonRes);
+                    
+                    setFoodName(parsed.foodName || aiMealText);
+                    setCalories(parsed.calories);
+                    setProtein(parsed.protein);
+                    setCarbs(parsed.carbs);
+                    setFat(parsed.fat);
+                    setAiMealText("");
+                    showToast("AI estimated macros! Click 'Add Meal Entry' to confirm.");
+                } catch (e) {
+                    showToast("Could not estimate meal. Please enter manually.");
+                } finally {
+                    setIsParsingMeal(false);
+                }
+            };
+
+            const calPct = Math.min(100, Math.round((consumedTotals.calories / nutrition.targetCalories) * 100));
+
+            return (
+                <div className="space-y-8">
+                    {/* Progress Dashboard */}
+                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-6">
+                        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-b border-slate-100 pb-4">
+                            <div>
+                                <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
+                                    <i className="fa-solid fa-list-check text-brand-600"></i>
+                                    Today's Food & Macro Tracker
+                                </h2>
+                                <p className="text-xs text-slate-500">Track your meals against calculated requirements for {new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}</p>
+                            </div>
+
+                            <div className="flex items-center gap-2 bg-slate-50 p-1.5 rounded-xl border border-slate-200">
+                                <span className="text-xs font-semibold text-slate-600 px-2">Water:</span>
+                                <button
+                                    onClick={() => setWaterIntake(w => Math.max(0, w - 0.25))}
+                                    className="w-7 h-7 bg-white rounded-lg border border-slate-200 font-bold text-slate-600 hover:bg-slate-100"
+                                >
+                                    -
+                                </button>
+                                <span className="text-xs font-bold text-sky-600 px-1">{waterIntake.toFixed(2)} L</span>
+                                <button
+                                    onClick={() => setWaterIntake(w => w + 0.25)}
+                                    className="w-7 h-7 bg-sky-500 text-white rounded-lg font-bold hover:bg-sky-600 shadow-sm"
+                                >
+                                    +
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Progress Bar & Cards */}
+                        <div className="space-y-4">
+                            <div>
+                                <div className="flex justify-between items-center text-sm font-bold mb-2">
+                                    <span className="text-slate-800">Calorie Budget</span>
+                                    <span className={consumedTotals.calories > nutrition.targetCalories ? 'text-red-600' : 'text-brand-600'}>
+                                        {consumedTotals.calories} / {nutrition.targetCalories} kcal ({calPct}%)
+                                    </span>
+                                </div>
+                                <div className="w-full bg-slate-100 h-4 rounded-full overflow-hidden p-0.5 border border-slate-200">
+                                    <div
+                                        className={`h-full rounded-full transition-all duration-500 ${
+                                            consumedTotals.calories > nutrition.targetCalories ? 'bg-red-500' : 'bg-gradient-to-r from-brand-500 to-emerald-400'
+                                        }`}
+                                        style={{ width: `${calPct}%` }}
+                                    ></div>
+                                </div>
+                            </div>
+
+                            {/* Macro Target Progress Cards */}
+                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2">
+                                {/* Protein */}
+                                <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                                    <div className="flex justify-between text-xs font-bold mb-1">
+                                        <span className="text-emerald-700">Protein</span>
+                                        <span className="text-slate-800">{consumedTotals.protein} / {nutrition.macros.proteinGrams}g</span>
+                                    </div>
+                                    <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
+                                        <div className="bg-emerald-500 h-full rounded-full" style={{ width: `${Math.min(100, (consumedTotals.protein / nutrition.macros.proteinGrams) * 100)}%` }}></div>
+                                    </div>
+                                </div>
+
+                                {/* Carbs */}
+                                <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                                    <div className="flex justify-between text-xs font-bold mb-1">
+                                        <span className="text-amber-700">Carbohydrates</span>
+                                        <span className="text-slate-800">{consumedTotals.carbs} / {nutrition.macros.carbGrams}g</span>
+                                    </div>
+                                    <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
+                                        <div className="bg-amber-500 h-full rounded-full" style={{ width: `${Math.min(100, (consumedTotals.carbs / nutrition.macros.carbGrams) * 100)}%` }}></div>
+                                    </div>
+                                </div>
+
+                                {/* Fat */}
+                                <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                                    <div className="flex justify-between text-xs font-bold mb-1">
+                                        <span className="text-rose-700">Fats</span>
+                                        <span className="text-slate-800">{consumedTotals.fat} / {nutrition.macros.fatGrams}g</span>
+                                    </div>
+                                    <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
+                                        <div className="bg-rose-500 h-full rounded-full" style={{ width: `${Math.min(100, (consumedTotals.fat / nutrition.macros.fatGrams) * 100)}%` }}></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                        {/* Meal Input Form Column */}
+                        <div className="lg:col-span-5 bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-6">
+                            <h3 className="text-base font-bold text-slate-900 border-b border-slate-100 pb-3 flex items-center gap-2">
+                                <i className="fa-solid fa-plus-circle text-brand-600"></i>
+                                Log a Meal or Food Item
+                            </h3>
+
+                            {/* AI Natural Language Fast Assistant */}
+                            <div className="bg-gradient-to-r from-brand-50 to-emerald-50 p-4 rounded-xl border border-brand-200 space-y-3">
+                                <label className="block text-xs font-bold text-brand-900 uppercase tracking-wider flex items-center gap-1.5">
+                                    <i className="fa-solid fa-wand-magic-sparkles text-brand-600"></i>
+                                    AI Fast Food Parser
+                                </label>
+                                <p className="text-xs text-slate-600">Type what you ate (e.g. "2 boiled eggs with 2 whole wheat toasts & coffee") and Gemini will estimate the macros!</p>
+                                <div className="flex gap-2">
+                                    <input
+                                        type="text"
+                                        placeholder="Describe your food..."
+                                        value={aiMealText}
+                                        onChange={(e) => setAiMealText(e.target.value)}
+                                        className="flex-1 px-3 py-2 bg-white border border-brand-200 rounded-lg text-xs focus:ring-2 focus:ring-brand-500"
+                                    />
+                                    <button
+                                        type="button"
+                                        onClick={handleParseMealWithAi}
+                                        disabled={isParsingMeal || !aiMealText.trim()}
+                                        className="px-3 py-2 bg-brand-600 text-white rounded-lg text-xs font-semibold shadow hover:bg-brand-700 disabled:opacity-50"
+                                    >
+                                        {isParsingMeal ? <i className="fa-solid fa-spinner fa-spin"></i> : "Parse"}
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Meal Category Selector */}
+                            <div>
+                                <label className="block text-xs font-semibold text-slate-700 mb-2 uppercase tracking-wider">Meal Category</label>
+                                <div className="grid grid-cols-4 gap-1.5 bg-slate-100 p-1 rounded-xl">
+                                    {["Breakfast", "Lunch", "Dinner", "Snack"].map((cat) => (
+                                        <button
+                                            key={cat}
+                                            type="button"
+                                            onClick={() => setActiveMealCategory(cat)}
+                                            className={`py-2 text-xs font-bold rounded-lg transition-all ${
+                                                activeMealCategory === cat
+                                                    ? 'bg-white text-slate-900 shadow-sm'
+                                                    : 'text-slate-500 hover:text-slate-900'
+                                            }`}
+                                        >
+                                            {cat}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+
+                            {/* Standard Manual Inputs */}
+                            <form onSubmit={handleAddFood} className="space-y-4">
+                                <div>
+                                    <label className="block text-xs font-semibold text-slate-700 mb-1">Food / Dish Name</label>
+                                    <input
+                                        type="text"
+                                        placeholder="e.g., Grilled Chicken Salad"
+                                        value={foodName}
+                                        onChange={(e) => setFoodName(e.target.value)}
+                                        className="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-brand-500"
+                                    />
+                                </div>
+
+                                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                                    <div>
+                                        <label className="block text-[11px] font-semibold text-slate-600 mb-1">Calories</label>
+                                        <input
+                                            type="number"
+                                            placeholder="kcal"
+                                            value={calories}
+                                            onChange={(e) => setCalories(e.target.value)}
+                                            className="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-brand-500 font-bold"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-[11px] font-semibold text-slate-600 mb-1">Protein (g)</label>
+                                        <input
+                                            type="number"
+                                            placeholder="g"
+                                            value={protein}
+                                            onChange={(e) => setProtein(e.target.value)}
+                                            className="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-brand-500"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-[11px] font-semibold text-slate-600 mb-1">Carbs (g)</label>
+                                        <input
+                                            type="number"
+                                            placeholder="g"
+                                            value={carbs}
+                                            onChange={(e) => setCarbs(e.target.value)}
+                                            className="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-brand-500"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-[11px] font-semibold text-slate-600 mb-1">Fat (g)</label>
+                                        <input
+                                            type="number"
+                                            placeholder="g"
+                                            value={fat}
+                                            onChange={(e) => setFat(e.target.value)}
+                                            className="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-brand-500"
+                                        />
+                                    </div>
+                                </div>
+
+                                <button
+                                    type="submit"
+                                    className="w-full py-3 bg-slate-900 hover:bg-slate-800 text-white font-semibold rounded-xl text-sm transition-all shadow-md"
+                                >
+                                    Add Meal Entry
+                                </button>
+                            </form>
+                        </div>
+
+                        {/* Meal Log List Column */}
+                        <div className="lg:col-span-7 bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
+                            <h3 className="text-base font-bold text-slate-900 border-b border-slate-100 pb-3 flex items-center justify-between">
+                                <span>Logged Meals for Today</span>
+                                <span className="text-xs font-normal text-slate-500">{todaysLogs.length} items</span>
+                            </h3>
+
+                            {todaysLogs.length === 0 ? (
+                                <div className="py-12 text-center text-slate-400">
+                                    <i className="fa-solid fa-utensils text-4xl mb-3 block opacity-30"></i>
+                                    <p className="text-sm">No food logged yet today.</p>
+                                    <p className="text-xs mt-1">Use the form or AI Fast Parser to start tracking!</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-3 custom-scrollbar max-h-[480px] overflow-y-auto pr-1">
+                                    {todaysLogs.map((item) => (
+                                        <div key={item.id} className="p-4 rounded-xl border border-slate-200 bg-slate-50/50 flex justify-between items-center">
+                                            <div>
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-brand-100 text-brand-800">
+                                                        {item.category}
+                                                    </span>
+                                                    <h4 className="font-bold text-slate-900 text-sm">{item.name}</h4>
+                                                </div>
+                                                <div className="text-xs text-slate-500 mt-1 space-x-3">
+                                                    <span>Protein: <strong className="text-slate-700">{item.protein}g</strong></span>
+                                                    <span>Carbs: <strong className="text-slate-700">{item.carbs}g</strong></span>
+                                                    <span>Fat: <strong className="text-slate-700">{item.fat}g</strong></span>
+                                                </div>
+                                            </div>
+
+                                            <div className="flex items-center gap-4">
+                                                <span className="font-extrabold text-slate-900 text-sm">{item.calories} <span className="text-xs font-normal text-slate-500">kcal</span></span>
+                                                <button
+                                                    onClick={() => handleDeleteFood(item.id)}
+                                                    className="text-slate-400 hover:text-red-600 transition-colors"
+                                                    title="Delete item"
+                                                >
+                                                    <i className="fa-solid fa-trash-can text-sm"></i>
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function ProgressTab({ profile, setProfile, nutrition, weightHistory, setWeightHistory, showToast }) {
+            const [newWeight, setNewWeight] = useState("");
+            const chartRef = useRef(null);
+            const chartInstance = useRef(null);
+
+            // Add Weight Entry
+            const handleAddWeight = (e) => {
+                e?.preventDefault();
+                if (!newWeight) return;
+
+                const todayStr = new Date().toISOString().split('T')[0];
+                const updated = [...weightHistory, { date: todayStr, weight: Number(newWeight) }];
+                setWeightHistory(updated);
+                setProfile(p => ({ ...p, weightKg: Number(newWeight) }));
+                setNewWeight("");
+                showToast("Weight history updated!");
+            };
+
+            // Render Chart.js
+            useEffect(() => {
+                if (!chartRef.current) return;
+
+                if (chartInstance.current) {
+                    chartInstance.current.destroy();
+                }
+
+                const ctx = chartRef.current.getContext('2d');
+                chartInstance.current = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: weightHistory.map(h => h.date),
+                        datasets: [
+                            {
+                                label: 'Body Weight (kg)',
+                                data: weightHistory.map(h => h.weight),
+                                borderColor: '#16a34a',
+                                backgroundColor: 'rgba(22, 163, 74, 0.1)',
+                                fill: true,
+                                tension: 0.3,
+                                pointRadius: 5,
+                                pointBackgroundColor: '#16a34a'
+                            },
+                            {
+                                label: 'Target Weight Goal',
+                                data: weightHistory.map(() => profile.targetWeightKg),
+                                borderColor: '#94a3b8',
+                                borderDash: [6, 6],
+                                fill: false,
+                                pointRadius: 0
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { position: 'top' }
+                        },
+                        scales: {
+                            y: {
+                                title: { display: true, text: 'Weight (kg)' }
+                            }
+                        }
+                    }
+                });
+
+                return () => {
+                    if (chartInstance.current) chartInstance.current.destroy();
+                };
+            }, [weightHistory, profile.targetWeightKg]);
+
+            const weightDiff = (profile.weightKg - profile.targetWeightKg).toFixed(1);
+
+            return (
+                <div className="space-y-8">
+                    {/* Header Summary */}
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
+                        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm text-center">
+                            <span className="text-xs text-slate-400 block font-semibold uppercase tracking-wider">Current Weight</span>
+                            <span className="text-3xl font-black text-slate-900 mt-1 block">{profile.weightKg} kg</span>
+                            <span className="text-xs text-emerald-600 font-semibold mt-1 block">BMI: {nutrition.bmi}</span>
+                        </div>
+
+                        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm text-center">
+                            <span className="text-xs text-slate-400 block font-semibold uppercase tracking-wider">Target Weight</span>
+                            <span className="text-3xl font-black text-brand-700 mt-1 block">{profile.targetWeightKg} kg</span>
+                            <span className="text-xs text-slate-500 mt-1 block">
+                                {Number(weightDiff) > 0 ? `${weightDiff} kg remaining to lose` : Number(weightDiff) < 0 ? `${Math.abs(weightDiff)} kg remaining to gain` : 'Goal achieved!'}
+                            </span>
+                        </div>
+
+                        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm text-center">
+                            <span className="text-xs text-slate-400 block font-semibold uppercase tracking-wider">Healthy Range</span>
+                            <span className="text-3xl font-black text-slate-800 mt-1 block">{nutrition.idealWeightMin} - {nutrition.idealWeightMax} kg</span>
+                            <span className="text-xs text-slate-500 mt-1 block">Based on WHO BMI guidelines</span>
+                        </div>
+                    </div>
+
+                    {/* Chart Card */}
+                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-6">
+                        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-b border-slate-100 pb-4">
+                            <div>
+                                <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+                                    <i className="fa-solid fa-chart-line text-brand-600"></i>
+                                    Weight Progress Over Time
+                                </h3>
+                                <p className="text-xs text-slate-500">Track your weigh-ins against your target goal trajectory</p>
+                            </div>
+
+                            {/* Add weigh-in form */}
+                            <form onSubmit={handleAddWeight} className="flex gap-2">
+                                <input
+                                    type="number"
+                                    step="0.1"
+                                    placeholder="Log weight (kg)"
+                                    value={newWeight}
+                                    onChange={(e) => setNewWeight(e.target.value)}
+                                    className="px-3 py-2 border border-slate-200 rounded-xl text-xs font-semibold focus:ring-2 focus:ring-brand-500"
+                                />
+                                <button
+                                    type="submit"
+                                    className="px-4 py-2 bg-brand-600 text-white rounded-xl text-xs font-bold hover:bg-brand-700 transition-colors"
+                                >
+                                    Log Weight
+                                </button>
+                            </form>
+                        </div>
+
+                        {/* Canvas container */}
+                        <div className="h-72 w-full">
+                            <canvas ref={chartRef}></canvas>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
